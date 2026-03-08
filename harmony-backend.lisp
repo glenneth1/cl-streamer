@@ -16,6 +16,12 @@
                 #:pipeline-current-track
                 #:pipeline-listener-count
                 #:pipeline-update-metadata
+                #:pipeline-play-voice
+                #:pipeline-stop-voice
+                #:pipeline-stop-all-voices
+                #:pipeline-volume-ramp
+                #:pipeline-read-metadata
+                #:pipeline-format-title
                 #:pipeline-add-hook
                 #:pipeline-remove-hook
                 #:pipeline-fire-hook)
@@ -37,6 +43,12 @@
            #:pipeline-current-track
            #:pipeline-listener-count
            #:pipeline-update-metadata
+           #:pipeline-play-voice
+           #:pipeline-stop-voice
+           #:pipeline-stop-all-voices
+           #:pipeline-volume-ramp
+           #:pipeline-read-metadata
+           #:pipeline-format-title
            #:pipeline-add-hook
            #:pipeline-remove-hook
            #:pipeline-fire-hook
@@ -58,10 +70,9 @@
            #:read-audio-metadata
            #:format-display-title
            #:update-all-mounts-metadata
-           ;; DJ support
+           ;; Legacy DJ aliases (deprecated — use protocol generics)
            #:pipeline-harmony-server
-           #:volume-ramp
-           #:pipeline-stop-all-voices))
+           #:volume-ramp))
 
 (in-package #:cl-streamer/harmony)
 
@@ -73,7 +84,9 @@
 (defclass streaming-drain (mixed:drain)
   ((outputs :initarg :outputs :accessor drain-outputs :initform nil
             :documentation "List of (encoder . mount-path) pairs")
-   (channels :initarg :channels :accessor drain-channels :initform 2)))
+   (channels :initarg :channels :accessor drain-channels :initform 2)
+   (server :initarg :server :accessor drain-server :initform nil
+           :documentation "The stream-server instance for writing audio data")))
 
 (defun drain-add-output (drain encoder mount-path)
   "Add an encoder/mount pair to the drain."
@@ -112,7 +125,7 @@
             (handler-case
                 (let ((encoded (encode-for-output encoder pcm-buffer num-samples)))
                   (when (> (length encoded) 0)
-                    (cl-streamer:write-audio-data mount-path encoded)))
+                    (cl-streamer:write-audio-data (drain-server drain) mount-path encoded)))
               (error (e)
                 (log:warn "Encode error for ~A: ~A" mount-path e)))))))
     ;; Sleep for most of the audio duration (leave headroom for encoding)
@@ -224,8 +237,6 @@
          (srv (or server
                   (let ((s (cl-streamer:make-stream-server :port port)))
                     (cl-streamer:start-server s)
-                    ;; Set global so write-audio-data/set-now-playing work
-                    (setf cl-streamer:*server* s)
                     s)))
          (pipeline (make-instance 'audio-pipeline
                                   :stream-server srv
@@ -233,9 +244,9 @@
                                   :channels channels))
          (encoders nil))
     (setf (pipeline-owns-server-p pipeline) owns-server)
-    ;; Create drain
+    ;; Create drain (with server reference for write-audio-data)
     (setf (pipeline-drain pipeline)
-          (make-instance 'streaming-drain :channels channels))
+          (make-instance 'streaming-drain :channels channels :server srv))
     ;; Process each output spec
     (dolist (spec outputs)
       (let* ((format (getf spec :format))
@@ -359,7 +370,7 @@
     (setf (pipeline-file-queue pipeline) nil))
   (log:info "Queue cleared"))
 
-(defun pipeline-stop-all-voices (pipeline)
+(defmethod pipeline-stop-all-voices ((pipeline audio-pipeline))
   "Immediately stop all active voices on the Harmony mixer.
    Used by DJ session to silence the auto-playlist before mixing."
   (let ((server (pipeline-harmony-server pipeline)))
@@ -373,6 +384,37 @@
             (error (e)
               (log:debug "Error stopping voice: ~A" e))))
         (log:info "All voices stopped on mixer")))))
+
+(defmethod pipeline-play-voice ((pipeline audio-pipeline) file-path
+                                &key (mixer :music) (on-end :disconnect))
+  "Play an audio file as a new voice on the pipeline's Harmony mixer.
+   Returns the voice object. Does NOT update metadata or track state."
+  (let* ((path (etypecase file-path
+                 (string (sb-ext:parse-native-namestring file-path))
+                 (pathname file-path)))
+         (server (pipeline-harmony-server pipeline))
+         (harmony:*server* server))
+    (harmony:play path :mixer mixer :on-end on-end)))
+
+(defmethod pipeline-stop-voice ((pipeline audio-pipeline) voice)
+  "Stop a voice on the pipeline's Harmony mixer."
+  (let* ((server (pipeline-harmony-server pipeline))
+         (harmony:*server* server))
+    (harmony:stop voice)))
+
+(defmethod pipeline-volume-ramp ((pipeline audio-pipeline) voice
+                                 target-volume duration &key (steps 20))
+  "Smoothly ramp a voice's volume to TARGET-VOLUME over DURATION seconds.
+   Delegates to the existing volume-ramp utility."
+  (volume-ramp voice target-volume duration :steps steps))
+
+(defmethod pipeline-read-metadata ((pipeline audio-pipeline) file-path)
+  "Read audio metadata from a file. Returns plist or NIL."
+  (read-audio-metadata file-path))
+
+(defmethod pipeline-format-title ((pipeline audio-pipeline) file-path)
+  "Build a display title for a file."
+  (format-display-title file-path))
 
 (defun pipeline-pop-queue (pipeline)
   "Pop the next entry from the file queue (internal use)."
@@ -426,8 +468,9 @@
 
 (defun update-all-mounts-metadata (pipeline display-title)
   "Update ICY metadata on all mount points."
-  (dolist (output (drain-outputs (pipeline-drain pipeline)))
-    (cl-streamer:set-now-playing (cdr output) display-title)))
+  (let ((server (pipeline-server pipeline)))
+    (dolist (output (drain-outputs (pipeline-drain pipeline)))
+      (cl-streamer:set-now-playing server (cdr output) display-title))))
 
 (defmethod pipeline-update-metadata ((pipeline audio-pipeline) title)
   "Update ICY metadata on all mount points (protocol method)."
@@ -676,7 +719,7 @@
 
 (defmethod pipeline-listener-count ((pipeline audio-pipeline) &optional mount)
   "Return the listener count from the stream server."
-  (cl-streamer:get-listener-count mount))
+  (cl-streamer:get-listener-count (pipeline-server pipeline) mount))
 
 ;;; ---- Hook System ----
 

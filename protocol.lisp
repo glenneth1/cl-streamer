@@ -88,6 +88,38 @@
   (:documentation "Update ICY metadata on all mount points."))
 
 ;;; ============================================================
+;;; Pipeline Voice Control Protocol
+;;; ============================================================
+;;; Voice-level operations for DJ mixing and direct playback control.
+;;; These wrap the backend's audio framework so callers don't need
+;;; to know about Harmony internals.
+
+(defgeneric pipeline-play-voice (pipeline file-path &key mixer on-end)
+  (:documentation "Play an audio file as a new voice on the pipeline's mixer.
+   Returns the voice object. Does NOT update metadata or track state.
+   MIXER selects the mixer bus (default :music).
+   ON-END controls voice cleanup (default :disconnect)."))
+
+(defgeneric pipeline-stop-voice (pipeline voice)
+  (:documentation "Stop a voice on the pipeline's mixer."))
+
+(defgeneric pipeline-stop-all-voices (pipeline)
+  (:documentation "Immediately stop all active voices on the pipeline's mixer."))
+
+(defgeneric pipeline-volume-ramp (pipeline voice target-volume duration &key steps)
+  (:documentation "Smoothly ramp a voice's volume to TARGET-VOLUME over DURATION seconds.
+   STEPS controls the number of intermediate volume changes (default 20).
+   Blocks the calling thread for DURATION seconds."))
+
+(defgeneric pipeline-read-metadata (pipeline file-path)
+  (:documentation "Read audio metadata (artist, title, album) from a file.
+   Returns a plist (:artist ... :title ... :album ...) or NIL."))
+
+(defgeneric pipeline-format-title (pipeline file-path)
+  (:documentation "Build a display title for a file (e.g. 'Artist - Title').
+   Falls back to the filename if tags are unavailable."))
+
+;;; ============================================================
 ;;; Pipeline Hook Protocol
 ;;; ============================================================
 ;;; Hooks replace direct slot access for callbacks.

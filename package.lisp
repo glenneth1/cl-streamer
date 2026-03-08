@@ -36,11 +36,8 @@
    #:listener-count
    
    ;; Main API
-   #:*server*
    #:*default-port*
    #:*default-metaint*
-   #:start
-   #:stop
    #:write-audio-data
    #:set-now-playing
    #:get-listener-count
@@ -80,6 +77,14 @@
    #:pipeline-current-track
    #:pipeline-listener-count
    #:pipeline-update-metadata
+   
+   ;; Protocol — Pipeline Voice Control (DJ support)
+   #:pipeline-play-voice
+   #:pipeline-stop-voice
+   #:pipeline-stop-all-voices
+   #:pipeline-volume-ramp
+   #:pipeline-read-metadata
+   #:pipeline-format-title
    
    ;; Protocol — Pipeline Hooks
    #:pipeline-add-hook
