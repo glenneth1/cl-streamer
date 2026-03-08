@@ -441,7 +441,7 @@
   "Read metadata (artist, title, album) from an audio file using taglib.
    Returns a plist (:artist ... :title ... :album ...) or NIL on failure."
   (handler-case
-      (let ((audio-file (audio-streams:open-audio-file (namestring file-path))))
+      (let ((audio-file (audio-streams:open-audio-file (sb-ext:native-namestring file-path))))
         (list :artist (safe-tag #'abstract-tag:artist audio-file)
               :title (safe-tag #'abstract-tag:title audio-file)
               :album (safe-tag #'abstract-tag:album audio-file)))
@@ -499,11 +499,13 @@
    UPDATE-METADATA controls whether ICY metadata is updated immediately."
   (let* ((path-string (etypecase file-path
                         (string file-path)
-                        (pathname (namestring file-path))))
+                        (pathname (sb-ext:native-namestring file-path))))
          ;; Use parse-native-namestring to prevent SBCL from interpreting
          ;; brackets as wildcard patterns. Standard (pathname ...) turns
          ;; "[FLAC]" into a wild component with non-simple strings, which
          ;; causes SIMPLE-ARRAY errors in cl-flac's CFFI calls.
+         ;; native-namestring above ensures no \[ escapes leak in, so
+         ;; parse-native-namestring won't double-escape them.
          (path (sb-ext:parse-native-namestring path-string))
          (server (pipeline-harmony-server pipeline))
          (harmony:*server* server)
@@ -630,7 +632,7 @@
                                  (error (retry-err)
                                    ;; Retry once after brief delay for transient FLAC init errors
                                    (log:debug "Retrying ~A after init error: ~A"
-                                              (pathname-name (pathname path)) retry-err)
+                                              (pathname-name (sb-ext:parse-native-namestring path)) retry-err)
                                    (sleep 0.2)
                                    (play-file pipeline path :title title
                                               :on-end :disconnect
