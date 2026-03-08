@@ -1,0 +1,295 @@
+#+TITLE: CL-Streamer
+#+AUTHOR: Glenn Thompson
+#+DATE: 2026-02-03
+
+* Overview
+
+CL-Streamer is a native Common Lisp audio streaming server built to replace
+the Icecast + Liquidsoap stack in [[https://asteroid.radio][Asteroid Radio]]. It provides HTTP audio
+streaming with ICY metadata, multi-format encoding (MP3 and AAC), and
+real-time audio processing via [[https://shirakumo.github.io/harmony/][Harmony]] and [[https://shirakumo.github.io/cl-mixed/][cl-mixed]] — all in a single Lisp
+process.
+
+The goal is to eliminate the Docker/C service dependencies (Icecast, Liquidsoap)
+and bring the entire audio pipeline under the control of the Lisp application.
+This means playlist management, stream encoding, metadata, listener stats, and
+the web frontend all live in one process and can interact directly.
+
+* Why Replace Icecast + Liquidsoap?
+
+The current Asteroid Radio stack runs three separate services in Docker:
+
+- *Liquidsoap* — reads the playlist, decodes audio, applies crossfade,
+  encodes to MP3/AAC, pushes to Icecast
+- *Icecast* — receives encoded streams, serves them to listeners over HTTP
+  with ICY metadata
+- *PostgreSQL* — stores playlist state, listener stats, etc.
+
+This works, but has significant friction:
+
+- *Operational complexity* — three Docker containers to manage, with
+  inter-service communication over HTTP and Telnet
+- *Playlist control* — Liquidsoap reads an M3U file; the Lisp app writes it
+  and pokes Liquidsoap via Telnet to reload. Clunky round-trip for
+  something that should be a function call
+- *Metadata* — requires polling Icecast's admin XML endpoint to get
+  listener stats, then correlating with our own data
+- *Crossfade/transitions* — configured in Liquidsoap's DSL, not
+  accessible to the application logic
+- *No live mixing* — adding DJ input or live mixing requires more
+  Liquidsoap configuration and another audio path
+
+With CL-Streamer, the Lisp process *is* the streaming server:
+
+- =play-list= and =play-file= are function calls, not Telnet commands
+- ICY metadata updates are immediate — =(set-now-playing mount title)=
+- Listener connections are tracked in-process, no XML polling needed
+- Crossfade parameters can be changed at runtime
+- Future: live DJ input via Harmony's mixer, with the same encoder pipeline
+
+* Architecture
+
+#+begin_example
+┌──────────────────────────────────────────────────────────┐
+│                    Lisp Process                          │
+│                                                          │
+│  ┌─────────┐    ┌──────────────┐    ┌─────────────────┐ │
+│  │ Harmony  │───▶│ streaming-   │───▶│ MP3 Encoder     │ │
+│  │ (decode, │    │ drain        │    │ (LAME FFI)      │─┼──▶ /stream.mp3
+│  │  mix,    │    │ (float→s16   │    └─────────────────┘ │
+│  │  effects)│    │  conversion) │    ┌─────────────────┐ │
+│  └─────────┘    └──────────────┘───▶│ AAC Encoder     │ │
+│       ▲                              │ (FDK-AAC shim)  │─┼──▶ /stream.aac
+│       │                              └─────────────────┘ │
+│  ┌─────────┐                         ┌─────────────────┐ │
+│  │ Playlist │    ICY metadata ──────▶│ HTTP Server     │ │
+│  │ Manager  │    Listener stats ◀────│ (usocket)       │ │
+│  └─────────┘                         └─────────────────┘ │
+└──────────────────────────────────────────────────────────┘
+#+end_example
+
+** Harmony Integration
+
+[[https://shirakumo.github.io/harmony/][Harmony]] is Shinmera's Common Lisp audio framework built on top of cl-mixed.
+It handles audio decoding (FLAC, MP3, OGG, etc.), sample rate conversion,
+mixing, and effects processing.
+
+CL-Streamer connects to Harmony by replacing the default audio output drain
+with a custom =streaming-drain= that intercepts the mixed audio data.
+Instead of sending PCM to a sound card, we:
+
+1. Read interleaved IEEE 754 single-float samples from Harmony's pack buffer
+2. Convert to signed 16-bit PCM
+3. Feed to all registered encoders (MP3 via LAME, AAC via FDK-AAC)
+4. Write encoded bytes to per-mount broadcast ring buffers
+5. HTTP clients read from these buffers with burst-on-connect
+
+Both voices (e.g., during crossfade) play through the same Harmony mixer
+and are automatically summed before reaching the drain — the encoders see
+a single mixed signal.
+
+** The FDK-AAC C Shim
+
+SBCL's signal handlers conflict with FDK-AAC's internal memory access patterns.
+When FDK-AAC touches certain memory during =aacEncOpen= or =aacEncEncode=,
+SBCL's SIGSEGV handler intercepts it before FDK-AAC's own handler can run,
+causing a recursive signal fault.
+
+The solution is a thin C shim (=fdkaac-shim.c=, compiled to =libfdkaac-shim.so=)
+that wraps all FDK-AAC calls:
+
+- =fdkaac_open_and_init= — opens the encoder, sets all parameters (AOT,
+  sample rate, channels, bitrate, transport format, afterburner), and
+  runs the initialisation call, all from C
+- =fdkaac_encode= — sets up the buffer descriptors (=AACENC_BufDesc=) and
+  calls =aacEncEncode=, returning encoded ADTS frames
+- =fdkaac_close= — closes the encoder handle
+
+The Lisp side calls these via CFFI and never touches FDK-AAC directly.
+This avoids the signal handler conflict entirely.
+
+Note: one subtle bug was that FDK-AAC's =OUT_BITSTREAM_DATA= constant is
+=3=, not =1=. Getting this wrong causes =aacEncEncode= to return error 96
+with no useful error message. The fix was to use the proper enum constants
+from =aacenc_lib.h= rather than hardcoded integers.
+
+Additionally, the AAC encoder uses a PCM accumulation buffer to feed
+FDK-AAC exact =frameLength=-sized chunks (1024 frames for AAC-LC). Feeding
+arbitrary chunk sizes from Harmony's real-time callback produces audio
+artefacts.
+
+To rebuild the shim:
+
+#+begin_src sh
+gcc -shared -fPIC -o libfdkaac-shim.so fdkaac-shim.c -lfdk-aac
+#+end_src
+
+** Broadcast Buffer
+
+Each mount point has a ring buffer (=broadcast-buffer=) that acts as a
+single-producer, multi-consumer queue. The encoder writes encoded audio
+in, and each connected client reads from its own position.
+
+- Never blocks the producer — slow clients lose data rather than stalling
+  the encoder
+- Burst-on-connect — new clients receive ~4 seconds of recent audio
+  immediately for fast playback start
+- Condition variable signalling for efficient client wakeup
+
+** ICY Metadata Protocol
+
+The server implements the SHOUTcast/Icecast ICY metadata protocol:
+
+- Responds to =Icy-MetaData: 1= requests with metadata-interleaved streams
+- Injects metadata blocks at the configured =metaint= byte interval
+- =set-now-playing= updates the metadata for a mount, picked up by all
+  connected clients on their next metadata interval
+
+* Current Status
+
+*Working and tested:*
+
+- [X] HTTP streaming server with multiple mount points
+- [X] MP3 encoding via LAME (128kbps, configurable)
+- [X] AAC encoding via FDK-AAC with C shim (128kbps ADTS, configurable)
+- [X] Harmony audio backend with custom streaming drain
+- [X] Real-time float→s16 PCM conversion and dual-encoder output
+- [X] ICY metadata protocol (set-now-playing on track change)
+- [X] Broadcast ring buffer with burst-on-connect
+- [X] Sequential playlist playback with reliable track-end detection
+- [X] Crossfade between tracks (3s overlap, 2s fade-in/out)
+- [X] Multi-format simultaneous output (MP3 + AAC from same source)
+
+*Remaining work:*
+
+- [ ] Read file metadata (artist, title, album) from FLAC/MP3 tags via
+  cl-taglib and feed to ICY metadata (currently uses filename)
+- [ ] Flush AAC accumulation buffer at track boundaries for clean transitions
+- [ ] Integration with Asteroid Radio's playlist/queue system (replace
+  Liquidsoap Telnet control with direct function calls)
+- [ ] Integration with Asteroid Radio's listener statistics (replace
+  Icecast admin XML polling with in-process tracking)
+- [ ] Live DJ input via Harmony mixer (replace Liquidsoap's input sources)
+- [ ] Stream quality variants (low bitrate MP3, shuffle stream, etc.)
+- [ ] Robustness: auto-restart on encoder errors, watchdog, graceful
+  degradation
+
+* Integration with Asteroid Radio
+
+The plan is to load CL-Streamer as an ASDF system within the main Asteroid
+Radio Lisp image. The web application (Radiance) and the streaming server
+share the same process:
+
+- *Playlist control* — the web app's queue management calls =play-list=
+  and =play-file= directly, no IPC needed
+- *Now playing* — track changes call =set-now-playing=, which is
+  immediately visible to all connected ICY-metadata clients
+- *Listener stats* — the stream server tracks connections in-process;
+  the web app reads them directly for the admin dashboard
+- *Tag metadata* — cl-taglib (already a dependency of Asteroid) reads
+  FLAC/MP3 tags and passes artist/title/album to ICY metadata
+
+This eliminates the Docker containers for Icecast and Liquidsoap entirely.
+The only external service is PostgreSQL for persistent data.
+
+* File Structure
+
+| File                 | Purpose                                          |
+|----------------------+--------------------------------------------------|
+| =cl-streamer.asd=   | ASDF system definition                           |
+| =package.lisp=      | Package and exports                              |
+| =cl-streamer.lisp=  | Top-level API (start, stop, add-mount, etc.)     |
+| =stream-server.lisp=| HTTP server, client connections, ICY responses    |
+| =buffer.lisp=       | Broadcast ring buffer (single-producer, multi-consumer) |
+| =icy-protocol.lisp= | ICY metadata encoding and injection              |
+| =conditions.lisp=   | Error condition types                            |
+| =encoder.lisp=      | MP3 encoder (LAME wrapper)                       |
+| =lame-ffi.lisp=     | CFFI bindings for libmp3lame                     |
+| =aac-encoder.lisp=  | AAC encoder with frame accumulation buffer       |
+| =fdkaac-ffi.lisp=   | CFFI bindings for FDK-AAC (via shim)             |
+| =fdkaac-shim.c=     | C shim for FDK-AAC (avoids SBCL signal conflicts)|
+| =libfdkaac-shim.so= | Compiled shim shared library                     |
+| =harmony-backend.lisp= | Harmony integration: streaming-drain, crossfade, playlist |
+| =test-stream.lisp=  | End-to-end test: playlist with MP3 + AAC output  |
+
+* Dependencies
+
+** Lisp Libraries
+
+- [[https://github.com/Shinmera/harmony][harmony]] — audio framework (decode, mix, effects)
+- [[https://github.com/Shinmera/cl-mixed][cl-mixed]] — low-level audio mixing
+- [[https://github.com/Shinmera/cl-mixed-flac][cl-mixed-flac]] — FLAC decoding
+- [[https://github.com/Shinmera/cl-mixed-mpg123][cl-mixed-mpg123]] — MP3 decoding
+- [[https://common-lisp.net/project/cffi/][cffi]] — C foreign function interface
+- [[https://github.com/usocket/usocket][usocket]] — socket networking
+- [[https://edicl.github.io/flexi-streams/][flexi-streams]] — flexible stream types
+- [[https://github.com/sharplispers/log4cl][log4cl]] — logging
+- [[https://gitlab.common-lisp.net/alexandria/alexandria][alexandria]] — utility library
+- [[https://sionescu.github.io/bordeaux-threads/][bordeaux-threads]] — portable threading
+
+** C Libraries
+
+- [[https://lame.sourceforge.io/][libmp3lame]] — MP3 encoding
+- [[https://github.com/mstorsjo/fdk-aac][libfdk-aac]] — AAC encoding (via C shim)
+
+* Quick Start
+
+#+begin_src common-lisp
+;; Load the systems
+(ql:quickload '(:cl-streamer :cl-streamer/encoder
+                :cl-streamer/aac-encoder :cl-streamer/harmony))
+
+;; Start the HTTP server
+(cl-streamer:start :port 8000)
+
+;; Add mount points
+(cl-streamer:add-mount cl-streamer:*server* "/stream.mp3"
+                       :content-type "audio/mpeg"
+                       :bitrate 128
+                       :name "Asteroid Radio MP3")
+(cl-streamer:add-mount cl-streamer:*server* "/stream.aac"
+                       :content-type "audio/aac"
+                       :bitrate 128
+                       :name "Asteroid Radio AAC")
+
+;; Create encoders
+(defvar *mp3* (cl-streamer:make-mp3-encoder :sample-rate 44100
+                                             :channels 2
+                                             :bitrate 128))
+(defvar *aac* (cl-streamer:make-aac-encoder :sample-rate 44100
+                                             :channels 2
+                                             :bitrate 128000))
+
+;; Create pipeline with both outputs
+(defvar *pipeline* (cl-streamer/harmony:make-audio-pipeline
+                    :encoder *mp3*
+                    :stream-server cl-streamer:*server*
+                    :mount-path "/stream.mp3"))
+(cl-streamer/harmony:add-pipeline-output *pipeline* *aac* "/stream.aac")
+(cl-streamer/harmony:start-pipeline *pipeline*)
+
+;; Play a playlist with crossfade
+(cl-streamer/harmony:play-list *pipeline* '("/path/to/track1.flac"
+                                            "/path/to/track2.flac")
+                               :crossfade-duration 3.0
+                               :fade-in 2.0
+                               :fade-out 2.0)
+
+;; Or play individual files
+(cl-streamer/harmony:play-file *pipeline* "/path/to/track.flac"
+                               :title "Artist - Track Name")
+
+;; Update now-playing metadata
+(cl-streamer:set-now-playing "/stream.mp3" "Artist - Track Title")
+
+;; Check listeners
+(cl-streamer:get-listener-count)
+
+;; Stop everything
+(cl-streamer/harmony:stop-pipeline *pipeline*)
+(cl-streamer:stop)
+#+end_src
+
+* License
+
+AGPL-3.0

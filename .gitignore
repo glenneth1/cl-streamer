@@ -1,0 +1,11 @@
+# SBCL compiled files
+*.fasl
+*.lx64fsl
+
+# Editor backups
+*~
+\#*\#
+.#*
+
+# OS
+.DS_Store
