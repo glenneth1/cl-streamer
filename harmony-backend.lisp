@@ -685,16 +685,27 @@
                                  (harmony:stop voice)
                                  (setf prev-voice nil))
                                (incf idx))))
-                       (error (e)
-                         (log:warn "Error playing ~A: ~A" path e)
-                         (sleep 1)))))))
+                       (serious-condition (e)
+                        (log:warn "Error playing ~A: ~A" path e)
+                        (sleep 1)))))))
            ;; Clean up last voice
            (when prev-voice
              (let ((harmony:*server* (pipeline-harmony-server pipeline)))
                (volume-ramp prev-voice 0.0 fade-out)
                (harmony:stop prev-voice))))
-       (error (e)
-         (log:error "play-list thread crashed: ~A" e))))
+       (serious-condition (e)
+         (log:error "play-list thread crashed: ~A" e)
+         ;; Auto-restart if pipeline is still running — the crash was
+         ;; likely a transient native-code fault (SIGSEGV in decoder).
+         ;; Sleep briefly to avoid tight restart loops, then re-enter
+         ;; play-list which will pick up queued/remaining tracks.
+         (when (%pipeline-running pipeline)
+           (log:warn "Restarting playlist thread after crash...")
+           (sleep 2)
+           (play-list pipeline nil :crossfade-duration crossfade-duration
+                                   :fade-in fade-in
+                                   :fade-out fade-out
+                                   :loop-queue loop-queue)))))
    :name "cl-streamer-playlist"))
 
 ;;; ---- Backward-Compatible Aliases ----
