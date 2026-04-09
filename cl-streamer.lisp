@@ -13,11 +13,12 @@
    SERVER is the stream-server instance."
   (update-metadata server mount-path :title title :url url))
 
-(defparameter *browser-buffer-seconds* 5
-  "Estimated seconds of audio the browser buffers internally before playback.
-When a track change occurs on the server, the listener won't hear it for
-roughly this many seconds due to the browser's internal audio buffer.
-The now-playing API delays reporting the new title by this amount.")
+(defparameter *browser-buffer-seconds* 10
+  "Estimated seconds of delay between server-side track change and listener
+hearing it. Includes ring buffer burst, encode latency, and browser decode
+buffer. Measured empirically: 5s gave ~23s early, 23s gave ~14s late.
+Settling on 10s as best estimate. The now-playing API delays reporting
+the new title by this amount.")
 
 (defun get-listener-now-playing (server mount-path)
   "Return the title that a typical listener is currently hearing.
