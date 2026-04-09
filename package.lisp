@@ -40,7 +40,9 @@
    #:*default-metaint*
    #:write-audio-data
    #:set-now-playing
+   #:get-listener-now-playing
    #:get-listener-count
+   #:metadata-at-position
    
    ;; Encoder
    #:make-mp3-encoder

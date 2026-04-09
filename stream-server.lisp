@@ -24,6 +24,10 @@
    (genre :initarg :genre :accessor mount-genre :initform "Various")
    (buffer :initarg :buffer :accessor mount-buffer)
    (metadata :initform (make-icy-metadata) :accessor mount-metadata)
+   (metadata-timeline :initform nil :accessor mount-metadata-timeline
+                      :documentation "List of (buffer-pos . icy-metadata) entries, newest first.
+Clients use their read position to look up the correct metadata,
+so ICY metadata stays synchronized with the audio they are hearing.")
    (metadata-lock :initform (bt:make-lock "metadata-lock") :reader mount-metadata-lock)))
 
 (defclass client-connection ()
@@ -62,13 +66,33 @@
   (remhash path (server-mounts server)))
 
 (defun update-metadata (server path &key title url)
-  "Update the metadata for a mount point."
+  "Update the metadata for a mount point.
+Tags the new metadata with a wall-clock timestamp for the time-delayed
+now-playing API, and also updates the immediate metadata for ICY injection."
   (let ((mount (gethash path (server-mounts server))))
     (when mount
       (bt:with-lock-held ((mount-metadata-lock mount))
-        (let ((meta (mount-metadata mount)))
-          (when title (setf (icy-metadata-title meta) title))
-          (when url (setf (icy-metadata-url meta) url)))))))
+        (let ((meta (make-icy-metadata :title title :url url))
+              (now (get-internal-real-time)))
+          ;; Update the immediate metadata (for ICY injection to stream clients)
+          (setf (mount-metadata mount) meta)
+          ;; Push onto timeline with wall-clock timestamp (newest first)
+          (push (cons now meta) (mount-metadata-timeline mount))
+          ;; Keep at most 20 entries to bound memory.
+          (when (> (length (mount-metadata-timeline mount)) 20)
+            (setf (mount-metadata-timeline mount)
+                  (subseq (mount-metadata-timeline mount) 0 20))))))))
+
+(defun metadata-at-position (mount read-pos)
+  "Return the ICY metadata that should be active at READ-POS.
+Walks the timeline (newest first) and returns the first entry whose
+buffer position is <= READ-POS. Falls back to the current metadata
+if no timeline entry matches (e.g. before first track change)."
+  (bt:with-lock-held ((mount-metadata-lock mount))
+    (let ((timeline (mount-metadata-timeline mount)))
+      (dolist (entry timeline (mount-metadata mount))
+        (when (<= (car entry) read-pos)
+          (return (cdr entry)))))))
 
 (defun listener-count (server &optional path)
   "Return the number of connected listeners.
@@ -246,7 +270,9 @@
                          (return)))))))))
 
 (defun write-with-metadata (client data length)
-  "Write audio data with ICY metadata injection."
+  "Write audio data with ICY metadata injection.
+Uses the client's read position to look up the correct metadata from the
+mount's timeline, so ICY metadata stays synchronized with the audio."
   (let* ((stream (client-stream client))
          (mount (client-mount client))
          (metaint *default-metaint*)
@@ -259,8 +285,9 @@
                      (write-sequence data stream :start pos :end (+ pos bytes-until-meta))
                      (incf pos bytes-until-meta)
                      (setf (client-bytes-since-meta client) 0)
-                     (let ((meta-bytes (bt:with-lock-held ((mount-metadata-lock mount))
-                                         (encode-icy-metadata (mount-metadata mount)))))
+                     (let* ((meta (bt:with-lock-held ((mount-metadata-lock mount))
+                                    (mount-metadata mount)))
+                            (meta-bytes (encode-icy-metadata meta)))
                        (write-sequence meta-bytes stream)))
                    (progn
                      (write-sequence data stream :start pos :end length)

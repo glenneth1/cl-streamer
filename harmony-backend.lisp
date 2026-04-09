@@ -42,6 +42,7 @@
            #:pipeline-clear-queue
            #:pipeline-current-track
            #:pipeline-listener-count
+           #:pipeline-track-remaining
            #:pipeline-update-metadata
            #:pipeline-play-voice
            #:pipeline-stop-voice
@@ -171,6 +172,8 @@
                :reader pipeline-queue-lock)
    (skip-flag :initform nil :accessor pipeline-skip-flag
               :documentation "Set to T to skip the current track")
+   (current-voice :initform nil :accessor %pipeline-current-voice
+                  :documentation "The currently playing Harmony voice, for querying remaining time")
    (pending-playlist-path :initform nil :accessor pipeline-pending-playlist-path
                           :documentation "Playlist path queued by scheduler, applied when tracks start playing")
    (on-playlist-change :initarg :on-playlist-change :initform nil
@@ -638,6 +641,7 @@
                                               :on-end :disconnect
                                               :update-metadata (null prev-voice))))
                              (when voice
+                               (setf (%pipeline-current-voice pipeline) voice)
                                ;; If this isn't the first track, crossfade
                                (when (and prev-voice (> idx 0))
                                  (setf (mixed:volume voice) 0.0)
@@ -733,6 +737,12 @@
 (defmethod pipeline-listener-count ((pipeline audio-pipeline) &optional mount)
   "Return the listener count from the stream server."
   (cl-streamer:get-listener-count (pipeline-server pipeline) mount))
+
+(defun pipeline-track-remaining (pipeline)
+  "Return estimated seconds remaining for the current track, or NIL."
+  (let ((voice (%pipeline-current-voice pipeline)))
+    (when voice
+      (voice-remaining-seconds voice))))
 
 ;;; ---- Hook System ----
 
