@@ -40,7 +40,7 @@
    #:*default-metaint*
    #:write-audio-data
    #:set-now-playing
-   #:get-listener-now-playing
+   #:get-metadata-changed-at
    #:get-listener-count
    #:metadata-at-position
    
