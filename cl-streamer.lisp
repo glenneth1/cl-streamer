@@ -21,16 +21,14 @@ The client uses this plus its known buffer lag to schedule UI updates."
       (bt:with-lock-held ((mount-metadata-lock mount))
         (let ((timeline (mount-metadata-timeline mount)))
           (when timeline
-            ;; Timeline newest first, car is (internal-real-time . metadata)
-            ;; Convert internal-time-units to epoch ms
-            (let* ((change-ticks (caar timeline))
-                   (now-ticks (get-internal-real-time))
-                   (elapsed-ms (floor (* 1000 (- now-ticks change-ticks))
-                                      internal-time-units-per-second))
-                   (now-epoch-ms (floor (* 1000 (get-universal-time))))
-                   ;; Subtract CL epoch offset: 1900-01-01 to 1970-01-01
-                   (unix-epoch-ms (- now-epoch-ms (* 2208988800 1000))))
-              (- unix-epoch-ms elapsed-ms))))))))
+            ;; Timeline entries: (buffer-pos . (unix-time . metadata))
+            ;; Use the wall-clock unix timestamp directly.
+            ;; get-universal-time returns seconds since 1900-01-01;
+            ;; subtract 2208988800 to convert to Unix epoch (1970-01-01),
+            ;; then multiply by 1000 for milliseconds.
+            (let ((unix-time (cadar timeline)))
+              (when unix-time
+                (* 1000 (- unix-time 2208988800))))))))))
 
 (defun get-listener-count (server &optional mount-path)
   "Get the current listener count.
