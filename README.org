@@ -188,6 +188,8 @@ classes to provide alternative backends.
 - [X] SO_KEEPALIVE, TCP_NODELAY, write timeouts for robust connections
 - [X] Queue system with file queueing and playlist switching
 - [X] Live DJ input via Harmony mixer
+- [X] Position-based ICY metadata sync (timeline stores buffer write positions)
+- [X] Time-delayed now-playing API (=get-metadata-changed-at= returns epoch ms for client-side sync)
 
 *Future work:*
 
@@ -234,9 +236,23 @@ classes to provide alternative backends.
 
 ** C Libraries
 
-- [[https://lame.sourceforge.io/][libmp3lame]] — MP3 encoding
-- [[https://github.com/mstorsjo/fdk-aac][libfdk-aac]] — AAC encoding (via C shim)
-- [[https://github.com/sionescu/libfixposix][libfixposix]] — required by iolib
+Runtime + development headers (needed at build time for CFFI compilation):
+
+#+begin_src bash
+# Ubuntu/Debian
+sudo apt install -y \
+  libmp3lame-dev libfdk-aac-dev \
+  libflac-dev libmpg123-dev \
+  libtag1-dev libfixposix-dev gcc
+#+end_src
+
+- [[https://lame.sourceforge.io/][libmp3lame]] — MP3 encoding (via LAME FFI)
+- [[https://github.com/mstorsjo/fdk-aac][libfdk-aac]] — AAC encoding (via C shim, avoids SBCL signal handler conflicts)
+- [[https://xiph.org/flac/][libflac]] — FLAC decoding (via cl-mixed-flac)
+- [[https://www.mpg123.de/][libmpg123]] — MP3 decoding (via cl-mixed-mpg123)
+- [[https://taglib.org/][libtagc]] — audio metadata extraction (taglib C bindings)
+- [[https://github.com/sionescu/libfixposix][libfixposix]] — POSIX compatibility (required by iolib for socket networking)
+- =gcc= — C compiler (for building the FDK-AAC shim)
 
 * Quick Start
 
