@@ -149,6 +149,20 @@
 
 (defmethod mixed:end ((drain streaming-drain)))
 
+(defun flush-drain-outputs (drain)
+  "Flush all encoder outputs at a track boundary.
+   Calls encoder-flush on each encoder and writes any remaining
+   encoded data to the corresponding mount buffer."
+  (dolist (output (drain-outputs drain))
+    (let ((encoder (car output))
+          (mount-path (cdr output)))
+      (handler-case
+          (let ((flushed (encoder-flush encoder)))
+            (when (and flushed (> (length flushed) 0))
+              (cl-streamer:write-audio-data (drain-server drain) mount-path flushed)))
+        (error (e)
+          (log:warn "Flush error for ~A: ~A" mount-path e))))))
+
 ;;; ---- Audio Pipeline ----
 
 (defclass audio-pipeline ()
@@ -685,8 +699,11 @@
                                  (setf prev-voice voice)
                                  (log:info "Skipping current track"))
                                ;; If track ended naturally (no crossfade), clean up
+                               ;; and flush encoders to prevent leftover samples
+                               ;; from bleeding into the next track
                                (when (mixed:done-p voice)
                                  (harmony:stop voice)
+                                 (flush-drain-outputs (pipeline-drain pipeline))
                                  (setf prev-voice nil))
                                (incf idx))))
                        (serious-condition (e)
@@ -696,7 +713,9 @@
            (when prev-voice
              (let ((harmony:*server* (pipeline-harmony-server pipeline)))
                (volume-ramp prev-voice 0.0 fade-out)
-               (harmony:stop prev-voice))))
+               (harmony:stop prev-voice)))
+           ;; Flush any remaining samples from encoders
+           (flush-drain-outputs (pipeline-drain pipeline)))
        (serious-condition (e)
          (log:error "play-list thread crashed: ~A" e)
          ;; Auto-restart if pipeline is still running — the crash was

@@ -136,10 +136,33 @@
             (incf pos (length chunk)))
           result))))
 
+(defun flush-aac-encoder (encoder)
+  "Flush any remaining PCM samples from the accumulation buffer.
+   Pads with zeros to fill a complete frame, encodes it, and resets position.
+   Call this at track boundaries to prevent leftover samples from one track
+   bleeding into the next. Returns a byte vector of AAC data (may be empty
+   if the accumulation buffer was already empty)."
+  (let ((pos (aac-encoder-pcm-accum-pos encoder)))
+    (if (= pos 0)
+        (make-array 0 :element-type '(unsigned-byte 8))
+        (let* ((frame-samples (* (aac-encoder-frame-length encoder)
+                                 (aac-encoder-channels encoder)))
+               (accum (aac-encoder-pcm-accum encoder)))
+          ;; Pad remaining space with zeros
+          (loop for i from pos below frame-samples
+                do (setf (aref accum i) 0))
+          (setf (aac-encoder-pcm-accum-pos encoder) frame-samples)
+          (let ((encoded (encode-one-aac-frame encoder)))
+            (setf (aac-encoder-pcm-accum-pos encoder) 0)
+            encoded)))))
+
 ;;; ---- Protocol Methods ----
 
 (defmethod encoder-encode ((encoder aac-encoder) pcm-buffer num-samples)
   (encode-aac-pcm encoder pcm-buffer num-samples))
+
+(defmethod encoder-flush ((encoder aac-encoder))
+  (flush-aac-encoder encoder))
 
 (defmethod encoder-close ((encoder aac-encoder))
   (close-aac-encoder encoder))

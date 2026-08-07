@@ -55,6 +55,7 @@
    #:make-aac-encoder
    #:close-aac-encoder
    #:encode-aac-pcm
+   #:flush-aac-encoder
    
    ;; Protocol — Server
    #:server-start
