@@ -97,4 +97,10 @@
    ;; Protocol — Encoder
    #:encoder-encode
    #:encoder-flush
-   #:encoder-close))
+   #:encoder-close
+   
+   ;; Watchdog
+   #:*watchdog-interval*
+   #:*audio-stall-threshold*
+   #:*track-stall-threshold*
+   #:*encoder-error-threshold*))

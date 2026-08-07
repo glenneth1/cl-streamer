@@ -87,7 +87,11 @@
             :documentation "List of (encoder . mount-path) pairs")
    (channels :initarg :channels :accessor drain-channels :initform 2)
    (server :initarg :server :accessor drain-server :initform nil
-           :documentation "The stream-server instance for writing audio data")))
+           :documentation "The stream-server instance for writing audio data")
+   (last-audio-time :initform (get-universal-time) :accessor drain-last-audio-time
+                    :documentation "Universal time of last successful encode/write cycle")
+   (encoder-error-counts :initform (make-hash-table) :accessor drain-encoder-error-counts
+                         :documentation "Hash table mapping encoder to consecutive error count")))
 
 (defun drain-add-output (drain encoder mount-path)
   "Add an encoder/mount pair to the drain."
@@ -125,10 +129,17 @@
                 (mount-path (cdr output)))
             (handler-case
                 (let ((encoded (encode-for-output encoder pcm-buffer num-samples)))
+                  ;; Reset error count on success
+                  (setf (gethash encoder (drain-encoder-error-counts drain)) 0)
                   (when (> (length encoded) 0)
-                    (cl-streamer:write-audio-data (drain-server drain) mount-path encoded)))
+                    (cl-streamer:write-audio-data (drain-server drain) mount-path encoded))
+                  ;; Track successful audio flow
+                  (setf (drain-last-audio-time drain) (get-universal-time)))
               (error (e)
-                (log:warn "Encode error for ~A: ~A" mount-path e)))))))
+                (let ((counts (drain-encoder-error-counts drain)))
+                  (incf (gethash encoder counts 0))
+                  (log:warn "Encode error for ~A (count=~A): ~A"
+                            mount-path (gethash encoder counts) e))))))))
     ;; Sleep for most of the audio duration (leave headroom for encoding)
     (let* ((channels (drain-channels drain))
            (bytes-per-frame (* channels 2))  ; 2 bytes per sample (int16)
@@ -200,7 +211,16 @@
    (encoders :initform nil :accessor pipeline-encoders
              :documentation "List of (encoder . mount-path) pairs owned by the pipeline")
    (owns-server :initform nil :accessor pipeline-owns-server-p
-                :documentation "T if pipeline created the server and should stop it on shutdown")))
+                :documentation "T if pipeline created the server and should stop it on shutdown")
+   ;; Watchdog
+   (playlist-thread :initform nil :accessor pipeline-playlist-thread
+                    :documentation "Reference to the play-list thread for watchdog monitoring")
+   (watchdog-thread :initform nil :accessor pipeline-watchdog-thread
+                    :documentation "Reference to the watchdog thread")
+   (last-frame-pos :initform nil :accessor pipeline-last-frame-pos
+                   :documentation "Last known frame position of current voice, for stall detection")
+   (last-frame-pos-time :initform nil :accessor pipeline-last-frame-pos-time
+                        :documentation "Universal time when last-frame-pos was recorded")))
 
 (defun make-audio-pipeline (&key encoder stream-server (mount-path "/stream.mp3")
                                  (sample-rate 44100) (channels 2))
@@ -299,6 +319,127 @@
           (make-instance 'streaming-drain :channels (pipeline-channels pipeline))))
   (drain-add-output (pipeline-drain pipeline) encoder mount-path))
 
+;;; ---- Watchdog ----
+
+(defparameter *watchdog-interval* 10
+  "Seconds between watchdog checks.")
+(defparameter *audio-stall-threshold* 30
+  "Seconds without audio flow before triggering a pipeline restart.")
+(defparameter *track-stall-threshold* 30
+  "Seconds without frame position advance before skipping track.")
+(defparameter *encoder-error-threshold* 5
+  "Consecutive encoder errors before reinitializing that encoder.")
+
+(defun watchdog-reinit-encoder (pipeline encoder mount-path)
+  "Attempt to reinitialize a failing encoder by closing and recreating it."
+  (log:warn "Watchdog: reinitializing encoder for ~A" mount-path)
+  (handler-case
+      (progn
+        (cl-streamer:encoder-close encoder)
+        ;; Determine format and bitrate from the old encoder
+        (let* ((new-encoder
+                 (typecase encoder
+                   (cl-streamer::mp3-encoder
+                    (cl-streamer:make-mp3-encoder
+                     :bitrate (cl-streamer::encoder-bitrate encoder)
+                     :sample-rate (cl-streamer::encoder-sample-rate encoder)
+                     :channels (cl-streamer::encoder-channels encoder)))
+                   (cl-streamer::aac-encoder
+                    (cl-streamer:make-aac-encoder
+                     :bitrate (cl-streamer::aac-encoder-bitrate encoder)
+                     :sample-rate (cl-streamer::aac-encoder-sample-rate encoder)
+                     :channels (cl-streamer::aac-encoder-channels encoder)))
+                   (t
+                    (log:error "Watchdog: unknown encoder type, cannot reinit")
+                    (return-from watchdog-reinit-encoder nil)))))
+          ;; Replace the encoder in the drain's outputs list
+          (let ((drain (pipeline-drain pipeline)))
+            (setf (drain-outputs drain)
+                  (substitute (cons new-encoder mount-path)
+                              (cons encoder mount-path)
+                              (drain-outputs drain)
+                              :test #'(lambda (a b) (eq (car a) (car b)))))
+            ;; Reset error count
+            (remhash encoder (drain-encoder-error-counts drain)))
+          ;; Replace in pipeline's encoder list
+          (setf (pipeline-encoders pipeline)
+                (substitute (cons new-encoder mount-path)
+                            (cons encoder mount-path)
+                            (pipeline-encoders pipeline)
+                            :test #'(lambda (a b) (eq (car a) (car b)))))
+          (log:info "Watchdog: encoder reinitialized for ~A" mount-path)
+          t))
+    (error (e)
+      (log:error "Watchdog: failed to reinitialize encoder for ~A: ~A" mount-path e)
+      nil)))
+
+(defun watchdog-check (pipeline)
+  "Run a single watchdog check cycle. Returns T if pipeline is healthy."
+  (let ((drain (pipeline-drain pipeline))
+        (now (get-universal-time))
+        (healthy t))
+
+    ;; 1. Check encoder error counts
+    (when drain
+      (maphash
+       (lambda (encoder error-count)
+         (when (>= error-count *encoder-error-threshold*)
+           (let ((mount-path (cdr (assoc encoder (drain-outputs drain)
+                                          :test #'eq))))
+             (when mount-path
+               (watchdog-reinit-encoder pipeline encoder mount-path)
+               (setf healthy nil)))))
+       (drain-encoder-error-counts drain)))
+
+    ;; 2. Check audio flow
+    (when drain
+      (let ((elapsed (- now (drain-last-audio-time drain))))
+        (when (> elapsed *audio-stall-threshold*)
+          (log:error "Watchdog: no audio flow for ~As, pipeline may be stuck" elapsed)
+          (setf healthy nil)
+          ;; Force a skip to try to unstick playback
+          (setf (pipeline-skip-flag pipeline) t))))
+
+    ;; 3. Check playlist thread liveness
+    (let ((thread (pipeline-playlist-thread pipeline)))
+      (when (and thread (not (bt:thread-alive-p thread)))
+        (log:warn "Watchdog: playlist thread is dead")
+        (setf healthy nil)
+        ;; The serious-condition handler in play-list should auto-restart,
+        ;; but if it didn't, we clear the reference so a new one can be stored
+        (setf (pipeline-playlist-thread pipeline) nil)))
+
+    ;; 4. Check track stall (frame position not advancing)
+    (let ((voice (%pipeline-current-voice pipeline)))
+      (when (and voice (not (mixed:done-p voice)))
+        (let ((pos (ignore-errors (mixed:frame-position voice))))
+          (when pos
+            (let ((last-pos (pipeline-last-frame-pos pipeline)))
+              (when (and last-pos (= pos last-pos))
+                (let ((elapsed (- now (or (pipeline-last-frame-pos-time pipeline) now))))
+                  (when (> elapsed *track-stall-threshold*)
+                    (log:warn "Watchdog: track stalled at frame ~A for ~As, skipping" pos elapsed)
+                    (setf (pipeline-skip-flag pipeline) t)
+                    (setf healthy nil))))
+              (setf (pipeline-last-frame-pos pipeline) pos)
+              (setf (pipeline-last-frame-pos-time pipeline) now))))))
+
+    healthy))
+
+(defun watchdog-loop (pipeline)
+  "Main watchdog loop. Runs in a background thread."
+  (log:info "Watchdog started (interval=~As, audio-stall=~As, track-stall=~As, encoder-errors=~A)"
+            *watchdog-interval* *audio-stall-threshold*
+            *track-stall-threshold* *encoder-error-threshold*)
+  (loop while (%pipeline-running pipeline)
+        do (sleep *watchdog-interval*)
+           (when (%pipeline-running pipeline)
+             (handler-case
+                 (watchdog-check pipeline)
+               (error (e)
+                 (log:warn "Watchdog check error: ~A" e)))))
+  (log:info "Watchdog stopped"))
+
 (defmethod pipeline-start ((pipeline audio-pipeline))
   "Start the audio pipeline - initializes Harmony with our streaming drain."
   (when (%pipeline-running pipeline)
@@ -332,6 +473,10 @@
     (setf (pipeline-harmony-server pipeline) server)
     (mixed:start server))
   (setf (%pipeline-running pipeline) t)
+  ;; Start watchdog thread
+  (setf (pipeline-watchdog-thread pipeline)
+        (bt:make-thread (lambda () (watchdog-loop pipeline))
+                        :name "cl-streamer-watchdog"))
   (log:info "Audio pipeline started with streaming drain (~A outputs)"
             (length (drain-outputs (pipeline-drain pipeline))))
   pipeline)
@@ -339,6 +484,13 @@
 (defmethod pipeline-stop ((pipeline audio-pipeline))
   "Stop the audio pipeline. Cleans up owned encoders and server."
   (setf (%pipeline-running pipeline) nil)
+  ;; Wait for watchdog thread to exit
+  (when (pipeline-watchdog-thread pipeline)
+    (let ((thread (pipeline-watchdog-thread pipeline)))
+      (setf (pipeline-watchdog-thread pipeline) nil)
+      (handler-case
+          (bt:join-thread thread)
+        (error () nil))))
   (when (pipeline-harmony-server pipeline)
     (mixed:end (pipeline-harmony-server pipeline))
     (setf (pipeline-harmony-server pipeline) nil))
@@ -614,9 +766,10 @@
    Both voices play simultaneously through the mixer during crossfade.
    When LOOP-QUEUE is T, repeats the playlist from the start when tracks run out.
    Scheduler-queued tracks take priority over the repeat cycle."
-  (bt:make-thread
-   (lambda ()
-     (handler-case
+  (setf (pipeline-playlist-thread pipeline)
+        (bt:make-thread
+         (lambda ()
+           (handler-case
          (let ((prev-voice nil)
                (idx 0)
                (remaining-list (list (copy-list file-list)))
@@ -729,7 +882,7 @@
                                    :fade-in fade-in
                                    :fade-out fade-out
                                    :loop-queue loop-queue)))))
-   :name "cl-streamer-playlist"))
+         :name "cl-streamer-playlist")))
 
 ;;; ---- Backward-Compatible Aliases ----
 ;;; These allow existing code using cl-streamer/harmony:start-pipeline etc.

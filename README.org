@@ -192,10 +192,11 @@ classes to provide alternative backends.
 - [X] Time-delayed now-playing API (=get-metadata-changed-at= returns epoch ms for client-side sync)
 - [X] AAC accumulation buffer flush at track boundaries (prevents audio artifacts at hard transitions)
 - [X] Stream quality variants (MP3 128kbps, AAC 128kbps, MP3 64kbps low-bandwidth)
+- [X] Robustness: watchdog thread (encoder auto-reinit, audio flow monitoring, track stall detection, playlist thread liveness)
 
 *Future work:*
 
-- [ ] Robustness: auto-restart on encoder errors, watchdog
+- [ ] Configurable watchdog thresholds via API
 
 * File Structure
 
