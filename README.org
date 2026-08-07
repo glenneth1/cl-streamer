@@ -191,10 +191,10 @@ classes to provide alternative backends.
 - [X] Position-based ICY metadata sync (timeline stores buffer write positions)
 - [X] Time-delayed now-playing API (=get-metadata-changed-at= returns epoch ms for client-side sync)
 - [X] AAC accumulation buffer flush at track boundaries (prevents audio artifacts at hard transitions)
+- [X] Stream quality variants (MP3 128kbps, AAC 128kbps, MP3 64kbps low-bandwidth)
 
 *Future work:*
 
-- [ ] Stream quality variants (low bitrate, multiple quality levels)
 - [ ] Robustness: auto-restart on encoder errors, watchdog
 
 * File Structure
